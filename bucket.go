@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,7 @@ type Config struct {
 type Limiter struct {
 	cfg Config
 
+	mu     sync.Mutex
 	tokens float64
 	last   time.Time
 
@@ -39,10 +41,15 @@ func New(cfg Config) *Limiter {
 	}
 }
 
-// refill 按「从上一次补充到现在」的流逝时间补充令牌，并把令牌数裁剪到桶容量。
-func (l *Limiter) refill() {
+// refillLocked 按「从上一次补充到现在」的流逝时间补充令牌，并把令牌数裁剪到桶容量。
+// 时钟回退（流逝时间为负）时不做任何补充，也不把 last 往回拨。
+// 调用前必须持有 l.mu。
+func (l *Limiter) refillLocked() {
 	now := l.cfg.Clock.Now()
 	elapsed := now.Sub(l.last).Seconds()
+	if elapsed <= 0 {
+		return
+	}
 	l.tokens += elapsed * l.cfg.Rate
 	l.last = now
 	if l.tokens > l.cfg.Burst {
@@ -52,38 +59,63 @@ func (l *Limiter) refill() {
 
 // Tokens 返回当前可用的令牌数。它是只读的，不会改变限流器的状态。
 func (l *Limiter) Tokens() float64 {
-	t := l.tokens + l.cfg.Clock.Now().Sub(l.last).Seconds()*l.cfg.Rate
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	t := l.tokens
+	if elapsed := l.cfg.Clock.Now().Sub(l.last).Seconds(); elapsed > 0 {
+		t += elapsed * l.cfg.Rate
+	}
 	if t > l.cfg.Burst {
 		t = l.cfg.Burst
+	}
+	if t < 0 {
+		t = 0
 	}
 	return t
 }
 
 // Allow 尝试取走一个令牌：取到返回 true，没有令牌返回 false。
+// 令牌不足时不消耗任何令牌，不阻塞。
 func (l *Limiter) Allow() bool {
-	l.refill()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.refillLocked()
 
 	l.issued++
-	l.tokens--
-	if l.tokens < 0 {
-		l.denied++
-		return false
+	if l.tokens >= 1 {
+		l.tokens--
+		l.allowed++
+		return true
 	}
-	l.allowed++
-	return true
+	l.denied++
+	return false
 }
 
 // Wait 一直等到取到一个令牌为止。
 //
 // 契约：ctx 取消时立即返回 ctx.Err()，并且不消耗任何令牌。
 func (l *Limiter) Wait(ctx context.Context) error {
-	if l.cfg.Rate <= 0 {
-		return ErrNotAvailable
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	interval := time.Duration(float64(time.Second) / l.cfg.Rate)
-	l.cfg.Clock.Sleep(interval)
-	if l.Allow() {
-		return nil
+	for {
+		l.mu.Lock()
+		l.refillLocked()
+		if l.tokens >= 1 {
+			l.tokens--
+			l.mu.Unlock()
+			return nil
+		}
+		l.mu.Unlock()
+
+		if l.cfg.Rate <= 0 {
+			return ErrNotAvailable
+		}
+		interval := time.Duration(float64(time.Second) / l.cfg.Rate)
+		l.cfg.Clock.Sleep(interval)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
-	return ErrNotAvailable
 }
