@@ -12,6 +12,8 @@ type Stats struct {
 
 // Stats 返回当前统计快照。
 func (l *Limiter) Stats() Stats {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return Stats{
 		Issued:  l.issued,
 		Allowed: l.allowed,
